@@ -4,3 +4,6 @@ build-image-slurm:
 
 build-image:
 	docker build -t qc .
+
+start-container:
+	docker run -it --gpus all --rm --name qc -v $(shell pwd):/app/qc qc

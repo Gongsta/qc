@@ -85,3 +85,8 @@ urllib3==2.4.0
 wandb==0.19.9
 wrapt==1.17.2
 zipp==3.21.0
+
+# Missing requirements
+h5py
+egl_probe
+robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4
