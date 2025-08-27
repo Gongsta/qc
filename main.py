@@ -49,6 +49,7 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
+flags.DEFINE_bool('use_wandb', False, "use wandb")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
@@ -62,13 +63,17 @@ class LoggingHelper:
     def log(self, data, prefix, step):
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
-        self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+        if self.wandb_logger is not None:
+            self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
-    run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
+    if FLAGS.use_wandb:
+        run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
+    else:
+        run = None
     
-    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
+    FLAGS.save_dir = os.path.join(FLAGS.save_dir, FLAGS.env_name, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
 
@@ -156,7 +161,7 @@ def main(_):
     logger = LoggingHelper(
         csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
                     for prefix in prefixes},
-        wandb_logger=wandb,
+        wandb_logger=wandb if FLAGS.use_wandb else None,
     )
 
     offline_init_time = time.time()
@@ -326,8 +331,9 @@ def main(_):
             c_data["button_states"] = np.stack(data["button_states"], axis=0)
         np.savez(os.path.join(FLAGS.save_dir, "data.npz"), **c_data)
 
-    with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
-        f.write(run.url)
+    if FLAGS.use_wandb:
+        with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
+            f.write(run.url)
 
 if __name__ == '__main__':
     app.run(main)
