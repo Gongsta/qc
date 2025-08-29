@@ -1,5 +1,5 @@
 build-image-slurm:
-	srun --nodelist=trpro-slurm2 bash -lc 'hostname; slurm-start-dockerd.sh; \
+	srun --nodelist=trpro-slurm2 --cpus-per-task=19 --gres tmpdisk:40960 bash -lc 'hostname; DOCKER_DATA_ROOT=/home/s36gong/steven-docker-images slurm-start-dockerd.sh; \
 	    docker build -t qc .'
 
 build-image:
@@ -7,3 +7,7 @@ build-image:
 
 start-container:
 	docker run -it --gpus all --rm --name qc -v $(shell pwd):/app/qc qc
+
+start-container-slurm:
+	srun --nodelist=trpro-slurm2 --cpus-per-task=9 --gres tmpdisk:40960,shard:8192 --pty bash -lc 'hostname; DOCKER_DATA_ROOT=/home/s36gong/steven-docker-images slurm-start-dockerd.sh; \
+	    docker run -it --gpus all --rm --name qc -v /home/s36gong/qc:/app/qc qc'
