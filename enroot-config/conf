@@ -1,0 +1,22 @@
+environ() {
+    # Keep all the environment from the host
+    env
+}
+
+mounts() {
+    # Mount the X11 unix-domain socket
+    echo "/tmp/.X11-unix /tmp/.X11-unix none x-create=dir,bind"
+
+    # Mount the current working directory
+    echo "${PWD} ${PWD} none x-create=dir,bind"
+}
+
+hooks() {
+    date > "${ENROOT_ROOTFS}/last_started"
+}
+
+rc() {
+    echo "====== ENTERING ENROOT ======"
+    [ -f /last_started ] && cat /last_started
+    bash -i
+}

@@ -34,6 +34,15 @@ wget -r -np -nH --cut-dirs=2 -A "*.npz" https://rail.eecs.berkeley.edu/datasets/
 ```
 and include this flag in the command line `--ogbench_dataset_dir=[realpath/to/your/cube-quadruple-play-100m-v0/]` to make sure it is using the 100M-size dataset.
 
+
+## Steven experiments
+Don't care about online steps, we want this out of the box performance from offline.
+```bash
+# QC
+MUJOCO_GL=egl python3 main.py --run_group=offline-rl --agent.actor_type=best-of-n --agent.actor_num_samples=32 --env_name=cube-triple-play-singletask-task2-v0 --sparse=False --horizon_length=5 --online_steps=0
+```
+
+
 ## Reproducing paper results
 
 We include the example command for all the methods we evaluate in our paper below. For `scene` and `puzzle-3x3` domains, use `--sparse=True`. 

@@ -66,6 +66,374 @@ class LoggingHelper:
         if self.wandb_logger is not None:
             self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, FFMpegWriter
+from mpl_toolkits.mplot3d.art3d import Line3D
+
+# Fixed colors for plotting/animation
+EE_COLOR = 'tab:blue'     # End-effector trajectory color
+BLK_COLOR = 'tab:orange'  # Block trajectory color
+CURSOR_COLOR = 'tab:red'  # Leading cursor color
+
+def set_equal_3d(ax):
+    # Equal scaling for 3D axes
+    xlim = ax.get_xlim3d()
+    ylim = ax.get_ylim3d()
+    zlim = ax.get_zlim3d()
+    ranges = [xlim[1]-xlim[0], ylim[1]-ylim[0], zlim[1]-zlim[0]]
+    centers = [np.mean(xlim), np.mean(ylim), np.mean(zlim)]
+    r = max(ranges) / 2.0
+    ax.set_xlim3d([centers[0]-r, centers[0]+r])
+    ax.set_ylim3d([centers[1]-r, centers[1]+r])
+    ax.set_zlim3d([centers[2]-r, centers[2]+r])
+
+def _offset3d(scatter, x, y, z):
+    scatter._offsets3d = (np.array([x]), np.array([y]), np.array([z]))
+
+def _split_into_episodes(terminals):
+    """
+    Split dataset into episodes based on terminals array.
+    Returns list of episode index ranges [start, end).
+    """
+    T = len(terminals)
+    if T == 0:
+        return []
+
+    starts = [0]
+    ends = []
+
+    for t in range(T):
+        if terminals[t] == 1.0 or terminals[t] == True:
+            ends.append(t+1)  # inclusive end
+            if t+1 < T:
+                starts.append(t+1)  # next starts after terminal
+
+    if len(ends) < len(starts):
+        ends.append(T)
+
+    return list(zip(starts, ends))
+
+def _get_default_indices(observations, ee_cols, blk_cols, yaw_col):
+    """Auto-detect default column indices based on observation width if not provided.
+    Layout for width >= 27 (per user mapping):
+      12:15 -> effector_pos (x,y,z)
+      19:22 -> block_0_pos (x,y,z)
+      26    -> block_0_yaw
+    Fallback for small vectors: (0,1,2) and (3,4,5) with no yaw.
+    """
+    D = observations.shape[-1]
+    default_ee = (12, 13, 14) if D >= 27 else (0, 1, 2)
+    default_blk = (19, 20, 21) if D >= 27 else (3, 4, 5)
+    default_yaw = 26 if D >= 27 else None
+    ee_cols = ee_cols if ee_cols is not None else default_ee
+    blk_cols = blk_cols if blk_cols is not None else default_blk
+    yaw_col = yaw_col if yaw_col is not None else default_yaw
+    return ee_cols, blk_cols, yaw_col
+
+def extract_from_dataset(observations, ee_cols=None, blk_cols=None, yaw_col=None, block_index=0):
+    """
+    Extract EE and block trajectories from dataset observations using the provided
+    column indices, or auto-detected defaults if None.
+    Returns (ee_xyz, blk_xyz, blk_yaw_or_empty)
+    """
+    D = observations.shape[-1]
+    # Detect cos/sin yaw layout: 19 + 9*k per block
+    if ee_cols is None and blk_cols is None and yaw_col is None and D >= 19 and (D - 19) % 9 == 0:
+        ee_xyz = observations[:, 12:15].astype(float)
+        base = 19 + 9 * int(block_index)
+        if base + 9 > D:
+            raise ValueError(f"block_index {block_index} out of bounds for observation width {D}")
+        blk_xyz = observations[:, base:base+3].astype(float)
+        cos_yaw = observations[:, base+7].astype(float)
+        sin_yaw = observations[:, base+8].astype(float)
+        blk_yaw = np.arctan2(sin_yaw, cos_yaw).astype(float)
+        return ee_xyz, blk_xyz, blk_yaw
+
+    ee_cols, blk_cols, yaw_col = _get_default_indices(observations, ee_cols, blk_cols, yaw_col)
+    ee_xyz = observations[:, ee_cols].astype(float)
+    blk_xyz = observations[:, blk_cols].astype(float)
+    if yaw_col is None:
+        blk_yaw = np.empty((len(observations),), dtype=float)
+    else:
+        blk_yaw = observations[:, yaw_col].astype(float)
+    return ee_xyz, blk_xyz, blk_yaw
+
+def build_episode_segments(
+    dataset,
+    ee_cols=None, blk_cols=None, yaw_col=None,
+    stride=1
+):
+    """
+    Build per-episode segments (ee_xyz, blk_xyz, blk_yaw) with subsampling and optional frame/episode caps.
+    Returns (parsed_segments, total_frames, num_episodes_considered).
+    """
+    observations = dataset['observations']
+    terminals = dataset['terminals']
+
+    episodes = _split_into_episodes(terminals)
+    parsed = []
+    total_frames = 0
+    for s, e in episodes:
+        obs_seg = observations[s:e]
+        if len(obs_seg) < 2:
+            continue
+        step = max(1, stride)
+
+        XYZ_CENTER = np.array([0.425, 0.0, 0.0])
+        XYZ_SCALER = 10.0
+        ee_xyz, blk_xyz, blk_yaw = extract_from_dataset(obs_seg, ee_cols, blk_cols, yaw_col)
+        ee_xyz = ee_xyz / XYZ_SCALER + XYZ_CENTER
+        blk_xyz = blk_xyz / XYZ_SCALER + XYZ_CENTER
+        ee_xyz = ee_xyz[::step]
+        blk_xyz = blk_xyz[::step]
+        blk_yaw = blk_yaw[::step]
+
+        parsed.append((ee_xyz, blk_xyz, blk_yaw))
+        total_frames += len(ee_xyz)
+
+    return parsed, total_frames, len(episodes)
+
+def set_axes_limits_from_parsed(ax, parsed):
+    """Set axis limits from a list of (ee_xyz, blk_xyz, blk_yaw) segments and equalize scale."""
+    if len(parsed) == 0:
+        return
+    all_ee = np.concatenate([p[0] for p in parsed], axis=0)
+    all_blk = np.concatenate([p[1] for p in parsed], axis=0)
+    all_xyz = np.vstack([all_ee, all_blk])
+    ax.set_xlim(all_xyz[:,0].min(), all_xyz[:,0].max())
+    ax.set_ylim(all_xyz[:,1].min(), all_xyz[:,1].max())
+    ax.set_zlim(all_xyz[:,2].min(), all_xyz[:,2].max())
+    set_equal_3d(ax)
+
+def compute_success_rate(dataset):
+    """
+    Compute success rate as successful_episodes / total_episodes.
+    - Episodes are split using `terminals` (1 at end of episode).
+    - An episode is considered successful if any step within it has mask == 0,
+      per the definition that mask == 0 only when the task is complete.
+    Returns a float in [0,1].
+    """
+    masks = np.asarray(dataset['masks']).astype(float)
+    terminals = np.asarray(dataset['terminals']).astype(float)
+    episodes = _split_into_episodes(terminals)
+    total_episodes = len(episodes)
+    if total_episodes == 0:
+        return 0.0
+    successful = 0
+    for s, e in episodes:
+        if np.any(masks[s:e] == 0.0):
+            successful += 1
+    return successful / float(total_episodes)
+
+def plot_trajectories(
+    dataset,
+    ee_cols=None, blk_cols=None, yaw_col=None,
+    title="EE & Block Trajectories",
+    save_dir=".", png_name="ee_block_trajectories.png",
+    stride=1, max_episodes=None
+):
+    """
+    Static plot: handles dataset with observations, terminals, etc.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    fig = plt.figure(figsize=(9,7))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+
+    parsed, _, num_eps = build_episode_segments(
+        dataset,
+        ee_cols=ee_cols, blk_cols=blk_cols, yaw_col=yaw_col,
+        stride=stride
+    )
+    print(f"Found {num_eps} episodes")
+
+    for ee_xyz, blk_xyz, blk_yaw in tqdm.tqdm(parsed):
+        # EE in blue; Block in orange; leading EE head in red
+        ax.plot(ee_xyz[:,0], ee_xyz[:,1], ee_xyz[:,2], color=EE_COLOR, alpha=0.9)
+
+    set_axes_limits_from_parsed(ax, parsed)
+    plt.tight_layout()
+    out_png = os.path.join(save_dir, png_name)
+    plt.savefig(out_png)
+    plt.close(fig)
+    return out_png
+
+def animate_trajectories(
+    dataset,
+    ee_cols=None, blk_cols=None, yaw_col=None,
+    show_block_yaw=True,
+    title="EE & Block Trajectories (Animated)",
+    save_dir=".",
+    out_name="ee_block_trajectories",
+    fps=30, dpi=75,  # Reduced from 150 for faster rendering
+    stride=20,       # Increased from 10 to reduce frames
+):
+    """
+    Animated video from dataset with observations, terminals, etc.
+    - Subsamples frames by `stride`
+    - Uses terminals to split episodes properly.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    parsed, total_frames, num_eps = build_episode_segments(
+        dataset,
+        ee_cols=ee_cols, blk_cols=blk_cols, yaw_col=yaw_col,
+        stride=stride
+    )
+    print(f"Found {num_eps} episodes, animating first {len(parsed)}")
+
+    # Compute per-episode success flags aligned with parsed episodes
+    terminals = np.asarray(dataset['terminals']).astype(float)
+    masks = np.asarray(dataset['masks']).astype(float)
+    episodes_full = _split_into_episodes(terminals)
+
+    successes = []
+    for s, e in episodes_full:
+        if e - s < 2:
+            continue
+        # Episode considered included → compute success (mask == 0 anywhere in [s:e))
+        successes.append(bool(np.any(masks[s:e] == 0.0)))
+
+    if total_frames < 2:
+        raise ValueError("Not enough frames to animate. Check your indices/episode split/stride.")
+
+    fig = plt.figure(figsize=(9,7), dpi=dpi)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+
+    # Pre-create artists for each episode (render sequentially across frames)
+    artists = []
+    for i, (ee_xyz, blk_xyz, blk_yaw) in enumerate(parsed):
+        ee_line, = ax.plot([], [], [], lw=2, color=EE_COLOR, alpha=0.9)
+        blk_line, = ax.plot([], [], [], lw=2, linestyle='--', color=BLK_COLOR, alpha=0.9)
+        ee_start = ax.scatter(ee_xyz[0,0], ee_xyz[0,1], ee_xyz[0,2], marker='o', color=EE_COLOR, s=60)
+        ee_head  = ax.scatter(ee_xyz[0,0], ee_xyz[0,1], ee_xyz[0,2], marker='^', color=CURSOR_COLOR, s=70)
+        blk_start= ax.scatter(blk_xyz[0,0], blk_xyz[0,1], blk_xyz[0,2], marker='s', color=BLK_COLOR, s=60)
+
+        yaw_line = None
+        if show_block_yaw and yaw_col is not None:
+            yaw_line = Line3D([], [], [], color=BLK_COLOR, alpha=0.7)
+            ax.add_line(yaw_line)
+
+        artists.append({
+            "ee_line": ee_line, "blk_line": blk_line,
+            "ee_start": ee_start, "ee_head": ee_head, "blk_start": blk_start,
+            "yaw_line": yaw_line, "ee_xyz": ee_xyz, "blk_xyz": blk_xyz, "blk_yaw": blk_yaw
+        })
+
+    # Compute global limits from parsed
+    set_axes_limits_from_parsed(ax, parsed)
+    # Episode status overlay (top-left inside axes)
+    status_text = ax.text2D(0.02, 0.98, "", transform=ax.transAxes, ha='left', va='top')
+    plt.tight_layout()
+
+    # Flatten (ep, t) into a single global timeline
+    ep_lengths = [len(a["ee_xyz"]) for a in artists]
+    ep_offsets = np.cumsum([0] + ep_lengths[:-1])
+
+    def _map_frame_to_ep_t(f):
+        # f in [0, total_frames-1]
+        # find ep idx such that f < ep_offsets[i] + ep_lengths[i]
+        i = np.searchsorted(ep_offsets, f+1, side="right") - 1
+        t = f - ep_offsets[i]
+        return i, t
+
+    def init():
+        changed = []
+        for a in artists:
+            a["ee_line"].set_data([], []); a["ee_line"].set_3d_properties([])
+            a["blk_line"].set_data([], []); a["blk_line"].set_3d_properties([])
+            if a["yaw_line"] is not None:
+                a["yaw_line"].set_data([], []); a["yaw_line"].set_3d_properties([])
+                a["yaw_line"].set_visible(False)
+            a["ee_start"].set_visible(False)
+            a["blk_start"].set_visible(False)
+            a["ee_head"].set_visible(False)
+            changed.extend([a["ee_line"], a["blk_line"], a["ee_start"], a["blk_start"], a["ee_head"]])
+            if a["yaw_line"] is not None:
+                changed.append(a["yaw_line"])
+        status_text.set_text("")
+        return changed
+
+    # Pre-compute yaw data to avoid repeated calculations
+    if show_block_yaw and yaw_col is not None:
+        L = 0.02
+        for a in artists:
+            if len(a["blk_yaw"]) > 0:
+                # Pre-compute yaw line endpoints for all frames
+                yaw_data = []
+                for t in range(len(a["blk_xyz"])):
+                    x0, y0, z0 = a["blk_xyz"][t]
+                    dx = L * np.cos(a["blk_yaw"][t])
+                    dy = L * np.sin(a["blk_yaw"][t])
+                    yaw_data.append(([x0, x0+dx], [y0, y0+dy], [z0, z0]))
+                a["precomputed_yaw"] = yaw_data
+
+    def update(f):
+        i, t = _map_frame_to_ep_t(f)
+
+        # Show only the current episode; hide others entirely
+        for j in range(len(artists)):
+            aj = artists[j]
+            if j == i:
+                # Current episode: show up to current time t
+                a = artists[i]
+                ee, blk = a["ee_xyz"], a["blk_xyz"]
+                a["ee_line"].set_data(ee[:t+1,0], ee[:t+1,1]); a["ee_line"].set_3d_properties(ee[:t+1,2])
+                a["blk_line"].set_data(blk[:t+1,0], blk[:t+1,1]); a["blk_line"].set_3d_properties(blk[:t+1,2])
+                a["ee_start"].set_visible(True)
+                a["blk_start"].set_visible(True)
+                a["ee_head"].set_visible(True)
+                _offset3d(a["ee_head"], ee[t,0], ee[t,1], ee[t,2])
+                if a["yaw_line"] is not None and len(a["blk_yaw"]) > 0 and t < len(a["precomputed_yaw"]):
+                    # Use precomputed data for current yaw position
+                    yaw_x, yaw_y, yaw_z = a["precomputed_yaw"][t]
+                    a["yaw_line"].set_data(yaw_x, yaw_y); a["yaw_line"].set_3d_properties(yaw_z)
+                    a["yaw_line"].set_visible(True)
+            
+            else:
+                # Hide non-current episodes completely
+                aj["ee_line"].set_data([], []); aj["ee_line"].set_3d_properties([])
+                aj["blk_line"].set_data([], []); aj["blk_line"].set_3d_properties([])
+                if aj["yaw_line"] is not None:
+                    aj["yaw_line"].set_data([], []); aj["yaw_line"].set_3d_properties([])
+                    aj["yaw_line"].set_visible(False)
+                aj["ee_start"].set_visible(False)
+                aj["blk_start"].set_visible(False)
+                aj["ee_head"].set_visible(False)
+
+        # Update episode status text
+        if 0 <= i < len(successes):
+            status = "Success" if successes[i] else "Failure"
+            status_text.set_text(f"Episode {i+1}/{len(successes)}: {status}")
+        else:
+            status_text.set_text("")
+
+        # Return all artists that might have changed
+        return []
+
+    anim = FuncAnimation(
+        fig, update, init_func=init,
+        frames=total_frames, interval=1000.0/fps,
+        blit=False, repeat=False, save_count=total_frames
+    )
+
+    base = os.path.join(save_dir, out_name)
+
+    # Use faster writer settings
+    writer = FFMpegWriter(fps=fps,
+                         extra_args=['-preset', 'fast', '-crf', '28'],  # Faster encoding
+                         metadata={'title': out_name})
+    path = base + ".mp4"
+    anim.save(path, writer=writer)
+    plt.close(fig)
+    return path
+
+
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
     if FLAGS.use_wandb:
@@ -164,6 +532,11 @@ def main(_):
         wandb_logger=wandb if FLAGS.use_wandb else None,
     )
 
+    print("success rate ", compute_success_rate(train_dataset))
+    animate_trajectories(train_dataset)
+    # plot_trajectories(train_dataset)
+    return
+
     offline_init_time = time.time()
     # Offline RL
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
@@ -236,6 +609,7 @@ def main(_):
         action = action_queue.pop(0)
         
         next_ob, int_reward, terminated, truncated, info = env.step(action)
+        breakpoint()
         done = terminated or truncated
 
         if FLAGS.save_all_online_states:

@@ -1,12 +1,12 @@
 FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 
-# Set working directory
 WORKDIR /app
 
 # Install Python and pip
 RUN apt-get update && \
     apt-get install -y \
     libegl-dev \
+    ffmpeg \
     cmake \
     git \
     python3 \
